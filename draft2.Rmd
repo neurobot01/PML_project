@@ -1,0 +1,460 @@
+---
+title: "PML Prediction Assignment Writeup"
+author: "Ben Turner"
+date: "April 25, 2015"
+output: html_document
+---
+
+```{r, include=FALSE}
+library(reshape2)
+library(ggplot2)
+library(caret)
+```
+
+First, load the train/test data.
+
+```{r, render=FALSE}
+data <- read.csv('~/Documents/coursera//PML/project/pml-training.csv')
+test <- read.csv('~/Documents/coursera//PML/project/pml-testing.csv')
+```
+
+Next, a few philosophical issues: I won't use a trivial predictor like num_window or raw_timestamp_part_1, even though these are both present in the test set:
+
+```{r}
+sapply(test$num_window, function(val) ifelse(val %in% data$num_window, "yes", "no"))
+sapply(test$raw_timestamp_part_1, function(val) ifelse(val %in% data$raw_timestamp_part_1, "yes", "no"))
+```
+
+Likewise, I'll be operating under the assumption that there could be additional users (besides the six that were actually included), so I'll be trying to remove those individual influences, rather than tune my methods to these individuals.
+
+From the paper accompanying these data (<http://groupware.les.inf.puc-rio.br/public/papers/2013.Velloso.QAR-WLE.pdf>), many of the variables are "derived", and in fact take generally empty or NA values. I'd prefer to work with raw values anyway, but let's tabulate which variables even take non-NA values in test:
+
+```{r}
+counts <- melt(sapply(names(test), function(name) sum(!is.na(test[,name]))),value.name="Good count")
+print(counts)
+```
+
+As expected, the only variables with values in the test dataset are the 3-axis translation values for each of the three IMU components for each of the four sensors, plus the 3-axis rotation values and a "total_acceleration" for each of the four (for a total of 13*4 = `r 13*4` sensor variables). Referring to the list of "Good count" variables above, we can see there are `r sum(counts==20)` total such variables. The other variables are precisely the first 7 metadata variables (e.g., X, user_name, etc), plus the problem_id.
+
+For the sake of simplicity, I'll reduce both datasets to that subset of `r sum(counts==20)` variables.
+
+```{r, results='hide'}
+data <- data[,counts==20]
+test <- test[,counts==20]
+```
+
+Now, to remove individual user effects. First, note we can't just subtract each user's mean from their observations on each variable, because the baserates of classes are uneven:
+
+```{r}
+sapply(levels(data$user_name), function(names) summary(data$classe[data$user_name==names]))
+```
+
+I'll use regression to deal with this; here's a proof of concept for a randomly chosen variable:
+
+```{r, results='hide'}
+mf1 <- lm(gyros_belt_x ~ user_name + classe + 0, data=data)
+deuser <- data$gyros_belt_x
+for(i in 1:length(levels(data$user_name))) {
+   deuser[data$user_name==levels(data$user_name)[i]] <- 
+   deuser[data$user_name==levels(data$user_name)[i]] - mf1$coefficients[i]}
+```
+
+Looking at the original means for this variable conditioned on classe and user_name, note the large individual variability:
+
+```{r}
+original_mat <- tapply(data$gyros_belt_x, list(data$user_name, data$classe), mean)
+print(original_mat)
+```
+
+Now, working with the "deuser"ed data:
+
+```{r}
+deuser_mat <- tapply(deuser, list(data$user_name, data$classe), mean)
+print(deuser_mat)
+```
+
+So, in general the differences between users are much smaller:
+
+```{r}
+rowMeans(original_mat) # Original variability
+rowMeans(deuser_mat) # Corrected variability
+```
+
+However, all of this is only of use if it doesn't obscure the differences between classes. Using lm() was meant to ensure that was the case, and a quick check demonstrates that this strategy worked:
+
+```{r}
+original_mat[1,1]-original_mat[1,2] # Difference between two classes with one user
+deuser_mat[1,1]-deuser_mat[1,2] # Same difference using "deuser"ed data
+```
+
+Having demonstrated the general approach, the only thing left is to implement it for all the variables. Of course, any changes that I make to the training data, I must also make to the test data. Rather than get fancy, I'll just use some "for" loops.
+
+```{r, results='hide'}
+# Bearing in mind that the data now contain only the variables of interest, plus 8 that won't be getting adjusted.
+
+varsToAdjust <- names(data)[8:59]
+adjusted_data <- data
+adjusted_test <- test
+
+# Pull out some recycled elements
+names <- levels(data$user_name)
+user_name_vec <- data$user_name
+classe_vec <- data$classe
+
+for(var in varsToAdjust) {
+  mf1 <- lm(data[,var] ~ user_name_vec + classe_vec + 0)
+  for(i in 1:length(levels(user_name_vec))) {
+    adjusted_data[user_name_vec==names[i],var] <- 
+      adjusted_data[user_name_vec==names[i],var] - mf1$coefficients[i]
+    adjusted_test[test$user_name==names[i],var] <- 
+      adjusted_test[test$user_name==names[i],var] - mf1$coefficients[i]}
+  }
+```
+
+One more detail remains, which is that the observations in data really comprise timeseries, while the observations in test are single timepoints. This will mostly have the effect of increasing my confidence in, e.g., prediction accuracy, because multiple observations from the same timeseries will presumably be nonindependent; but, from the standpoint of having the test data match the training data, this is the best format (i.e., compared to reducing each timeseries somehow), so I'll leave it as-is for now.
+
+To keep things conceptually simple, I'll be using kNN classifier, but with some mildly sophisticated preprocessing to overcome some of kNN's shortcomings. In particular, I've implemented Classwise PCA (see <http://cbmspc.eng.uci.edu/SOFTWARE/CPCA/tutorial.pdf> or <http://cbmspc.eng.uci.edu/PUBLICATIONS/zn:07c.pdf>) in R by strictly translating the matlab code available at the author's website. The first and last few lines of each function (there are two) are printed below.
+
+```{r, include=FALSE}
+library(pracma)
+library(MASS)
+
+# All of this will presume the data have at least been demeaned, ideally scaled.
+
+dataprocFuncCpca <- function(TrainData,TrainLabels,m,Prior = "uniform",EvalKeep = "mean",DFEmethod="lda") {
+  
+  TrainData <- data.matrix(TrainData)
+  
+  Nobs <- length(TrainLabels)
+  classes <- unique(TrainLabels)
+  Nclass <- length(classes)
+  
+  NtrialA <- sapply(classes, function(label) sum(TrainLabels==label))
+  
+  sampMu <- matrix(nrow = Nclass, ncol = ncol(TrainData))
+  coeffrC <- list()
+  
+  for(c in 1:Nclass) {
+    
+    sampMu[c,] <- colMeans(TrainData[TrainLabels==classes[c],])
+    eigs <- eigen(cov(TrainData[TrainLabels==classes[c],]))
+    latent <- eigs$values[eigs$values>0]
+    coeff <- eigs$vectors[,eigs$values>0] # Missing from original matlab code.
+    
+    coeffrC[[c]] <- eigs$vectors[,latent>mean(latent)]
+    
+  }
+  
+  sampMuAll <- colMeans(TrainData)
+  
+  Data_b <- sapply(1:Nclass, function(c) sqrt(NtrialA[c]/Nobs) * (sampMu[c,]-sampMuAll))
+  Data_b <- scale(Data_b, scale=FALSE)
+  
+  tmp <- eigen(cov(t(Data_b)))
+  W_b <- tmp$vectors
+  
+  DRmatC <- list()
+  
+  P_i <- rep.int(1/Nclass, Nclass)
+  
+  for(c in 1:Nclass) {
+    
+    TempBasis <- orth(cbind(coeffrC[[c]],W_b))
+    TrainDataProj <- TrainData %*% TempBasis
+    
+    # TDFE <- lda(TrainDataProj, TrainLabels)
+    
+    DRmatC[[c]] <- TempBasis[,1:m] # %*% TDFE$scaling[,1:m]
+    
+  }
+  
+  DRmatC
+  
+}
+
+chooseSubspace <- function(TestData, TrainData, TrainLabels, Subspace, Prior = "empirical") {
+  
+  TestData <- data.matrix(TestData)
+  TrainData <- data.matrix(TrainData)
+  if(ncol(TestData) != ncol(TrainData)) {
+    TestData <- t(TestData)
+  }
+  
+  Nobs <- length(TrainLabels)
+  classes <- unique(TrainLabels)
+  Nclass <- length(classes)
+  
+  NtrialA <- sapply(classes, function(label) sum(TrainLabels==label))
+  
+  OptClass <- rep(0, Nclass)
+  MaxPosterior <- rep(0, Nclass)
+  
+  P_i <- rep.int(1/Nclass, Nclass)
+  
+  for(c in 1:Nclass) {
+    
+    TestFeature <- TestData %*% Subspace[[c]]
+    TrainFeature <- TrainData %*% Subspace[[c]]
+    Posterior <- rep(0, Nclass)
+    
+    for(i in 1:Nclass) {
+      
+      mu <- if(ncol(TrainFeature)==1) {
+        mean(TrainFeature[TrainLabels==classes[i]])
+        } else {colMeans(TrainFeature[TrainLabels==classes[i],])}
+      Sigma <- if(ncol(TrainFeature)==1) {
+        var(TrainFeature[TrainLabels==classes[i]])
+        } else {cov(TrainFeature[TrainLabels==classes[i],])}
+      
+      TF <- as.matrix(TestFeature - mu)
+      if(ncol(TrainFeature)==1) {
+        
+        Posterior[i] <- -0.5 * (TF^2)/Sigma - 
+                         0.5 * log(Sigma) + log(P_i[i])
+        
+      } else {
+      
+        Posterior[i] <- -0.5 * (TF %*% inv(Sigma) %*% t(TF)) - 
+                         0.5 * log(det(Sigma)) + log(P_i[i])
+        
+      }
+      
+    }
+    
+    Posterior <- Posterior/max(Posterior)
+    Posterior <- exp(Posterior)/sum(exp(Posterior))
+    
+    OptClass[c] <- which.max(Posterior)
+    MaxPosterior[c] <- max(Posterior)
+    
+  }
+  
+  MP <- max(MaxPosterior)
+  ind <- which.max(MaxPosterior)
+  
+  OptSubInd <- sample(ind,1)
+  OptClass <- OptClass[OptSubInd]-1
+  
+  outvals <- list(OptSubInd = OptSubInd, OptClass = OptClass)
+  
+}
+```
+
+```{r}
+head(dataprocFuncCpca)
+tail(dataprocFuncCpca)
+
+head(chooseSubspace)
+tail(chooseSubspace)
+```
+
+Next, I need to create training/test sets for internal cross-validation. For a single fold, I would use something like the following:
+
+```{r, results='hide'}
+inTrain <- createDataPartition(y=adjusted_data$classe,p=(nrow(adjusted_data)-30)/nrow(adjusted_data),list=FALSE)
+trainingSet<-adjusted_data[inTrain,]
+testingSet<-adjusted_data[-inTrain,]
+preObj<-preProcess(trainingSet[,c(8:59)],method=c("center","scale"))
+trainingSetNorm<-predict(preObj,trainingSet[,c(8:59)])
+testingSetNorm<-predict(preObj,testingSet[,c(8:59)])
+```
+
+However, there are (at least) two hyperparameters I need to tune, and results from a single fold aren't very reliable anyway. Some quick testing suggests that 2x5 folds takes 240s, so assuming everything scales linearly, I'm limited to roughly 25 times that. So, I'll do 25 folds, and within each, an additional 10 CV folds. After all of that, I'll 1) have a general idea of the range of performance to expect using this approach, and 2) have a set of parameters that should maximize out-of-sample performance. This will take the form of two nested loops (sketched out in pseudocode below). Obviously, preprocessing will happen only at the lowest level.
+
+```{r, results='hide'}
+
+# LOOP OVER TOP-LEVEL TRAIN/TEST SPLIT
+  # CREATE SECONDARY PARTITION
+  # LOOP OVER SECONDARY TRAIN/TEST SPLIT
+    # TEST PARAMETER SETTINGS, RECORDING BEST EACH TIME
+  # USE BEST SETTINGS FROM ACROSS ALL SECONDARY SPLITS TO PREDICT ON TOP-LEVEL TEST
+# CHOOSE BEST SETTINGS ACROSS ALL TOP-LEVEL SPLITS
+```
+
+```{r, include=FALSE, cache=TRUE}
+
+ntt <- 25 # Top-level folds
+ncv <- 10 # Sub-level folds
+
+inTrain <- createDataPartition(y=adjusted_data$classe,p=(nrow(adjusted_data)-25)/nrow(adjusted_data),list=FALSE,times=ntt)
+
+ttParams <- matrix(nrow = ntt, ncol = 2)
+ttPerf <- list()
+
+for(topLevelInd in 1:ntt) {
+  
+  topLevelTrain <- adjusted_data[inTrain[,topLevelInd],]
+  topLevelTest <- adjusted_data[-inTrain[,topLevelInd],]
+  
+  inCV <- createDataPartition(y=topLevelTrain$classe,p=(nrow(topLevelTrain)-25)/nrow(topLevelTrain),list=FALSE,times=ncv)
+
+  cvLevelBestParams <- matrix(nrow = ncv, ncol = 2)
+  cvLevelBestPerf <- rep.int(-Inf, ncv)
+  
+  for(cvLevelInd in 1:ncv) {
+    
+    cvLevelTrain <- topLevelTrain[inCV[,cvLevelInd],]
+    cvLevelTest <- topLevelTrain[-inCV[,cvLevelInd],]
+    
+    # preprocess lower-level data
+    preObj <- preProcess(cvLevelTrain[,c(8:59)],method=c("center","scale"))
+    trainingSet <- data.matrix(predict(preObj, cvLevelTrain[,c(8:59)]))
+    testingSet <- data.matrix(predict(preObj, cvLevelTest[,c(8:59)]))
+    
+    for(dims in 1:4) {
+      
+      cPCAout<-dataprocFuncCpca(trainingSet, cvLevelTrain$classe, dims)
+      predictions <- list() #factor(rep("A", length(cvLevelTest$classe)), levels = c("A","B","C","D","E"))
+      
+      k <- seq(1, 99, 2)
+      
+      for(ki in 1:length(k)) {
+        predictions[[ki]] <- factor(rep("A", length(cvLevelTest$classe)), levels = c("A","B","C","D","E"))
+      }
+      
+      for(item in 1:length(cvLevelTest$classe)) {
+        
+        Opts<-chooseSubspace(testingSet[item,],trainingSet,cvLevelTrain$classe,cPCAout)
+        TestProj<-testingSet[item,] %*% cPCAout[[Opts$OptSubInd]]
+        TrainProj<-trainingSet %*% cPCAout[[Opts$OptSubInd]]
+        
+        dists<-distmat(TestProj, TrainProj)
+        #   PKDE <- sapply(levels(trainingSet$classe), 
+        #          function(classes) 
+        #            sum(1/dists[trainingSet$classe==classes])/
+        #            length(dists[trainingSet$classe==classes]))
+        
+        for(ki in 1:length(k)) {
+          
+          lowest<-quantile(dists, probs=k[ki]/length(dists))
+          votes<-cvLevelTrain$classe[dists<=lowest]
+          tabs<-tabulate(votes)
+          predictions[[ki]][item] <- levels(cvLevelTrain$classe)[which.max(tabs)]
+          if(length(which(tabs==max(tabs)))>1) {
+            
+            lowdists <- dists[dists<=lowest]
+            sums <- sapply(which(tabs==max(tabs)), function(cvar) sum(lowdists[votes==levels(cvLevelTrain$classe)[cvar]]))
+            winner <- which(tabs==max(tabs))[which.min(sums)]
+            predictions[[ki]][item] <- levels(cvLevelTrain$classe)[winner]
+            
+          }
+          
+        } # End loop over k
+        
+      } # End loop over items
+      
+      for(ki in 1:length(k)) {
+        
+        acc <- sum(predictions[[ki]]==cvLevelTest$classe)
+        if(acc > cvLevelBestPerf[cvLevelInd]) {
+          cvLevelBestPerf[cvLevelInd] <- acc
+          cvLevelBestParams[cvLevelInd,] <- c(dims, k[ki])
+        }
+        
+      }
+      
+    } # End dims loop
+    
+  } # End CV loop
+  
+  # Choose best overall parameters from CV round
+  cvBestInd <- which(cvLevelBestPerf==max(cvLevelBestPerf))
+  if(length(cvBestInd)>1) {
+    cvBestInd=sample(cvBestInd,1)
+    } else {cvBestInd}
+  ttParams[topLevelInd,] <- cvLevelBestParams[cvBestInd,]
+  
+  # Now, fixing those parameters, preprocess topLevel train/test data
+  preObj <- preProcess(topLevelTrain[,c(8:59)],method=c("center","scale"))
+  trainingSet <- data.matrix(predict(preObj, topLevelTrain[,c(8:59)]))
+  testingSet <- data.matrix(predict(preObj, topLevelTest[,c(8:59)]))
+  
+  # And apply fixed algorithm
+  cPCAout<-dataprocFuncCpca(trainingSet, topLevelTrain$classe, ttParams[topLevelInd,1])
+  prediction <- factor(rep("A", length(topLevelTest$classe)), levels = c("A","B","C","D","E"))
+  
+  for(item in 1:length(topLevelTest$classe)) {
+    
+    Opts<-chooseSubspace(testingSet[item,],trainingSet,topLevelTrain$classe,cPCAout)
+    TestProj<-testingSet[item,] %*% cPCAout[[Opts$OptSubInd]]
+    TrainProj<-trainingSet %*% cPCAout[[Opts$OptSubInd]]
+    
+    dists<-distmat(TestProj, TrainProj)
+    lowest<-quantile(dists, probs=ttParams[topLevelInd,2]/length(dists))
+    votes<-topLevelTrain$classe[dists<=lowest]
+    tabs<-tabulate(votes)
+    prediction[item] <- levels(topLevelTrain$classe)[which.max(tabs)]
+    if(length(which(tabs==max(tabs)))>1) {
+      
+      lowdists <- dists[dists<=lowest]
+      sums <- sapply(which(tabs==max(tabs)), function(cvar) sum(lowdists[votes==levels(topLevelTrain$classe)[cvar]]))
+      winner <- which(tabs==max(tabs))[which.min(sums)]
+      prediction[item] <- levels(topLevelTrain$classe)[winner]
+      
+    }
+    
+  } # End loop over items
+  
+  # Record full performance, rather than just accuracy
+  ttPerf[[topLevelInd]] <- confusionMatrix(as.factor(prediction), topLevelTest$classe)
+  
+} # End train/test loop
+```
+
+Although the code that carries out this multi-level CV is too long for this document, the variables created along the way are accessible, so we can see a bit of what happened. A few details about how I implemented cPCA: first, I didn't do any additional feature extraction (i.e., I used the "identity" method), I chose to use the "mean" method of keeping eigenvectors, and I treated the class baserates as equal wherever possible. The parameters that I explored were 1) the dimensionality of each subspace (between 1 and 4), and 2) the value of k in the subsequent kNN (odds between 1 and 99). The motivation for the range on dimensionality was the advice of the creators, plus the intuitive idea that with 4 IMUs, there might be 4 dimensions. The motivation for the range of k was to go from the most trivial variant, up to approximately 0.5% of the total data.
+
+Let's examine how the results from the lower-level (i.e., hyperparameter tuning) step looked; in this case, the last step, because that's what's left.
+
+```{r}
+cbind(cvLevelBestParams, cvLevelBestPerf)
+```
+
+Unfortunately, the accuracy ("cvLevelBestPerf") wasn't normalized by the length of each test set, which may have varied, so this result will be unduly influenced by chance (i.e., which fold had the largest test set), but I'm out of time, so it will have to do. Let's have a look at the top-level CV performance.
+
+```{r}
+Accs <- unname(sapply(1:25, function(fold) ttPerf[[fold]]$overall["Accuracy"]))
+cbind(dimensionality = ttParams[,1], k = ttParams[,2], Accs)
+```
+
+Accuracy is pretty variable, and quite possibly reflects more about any given test set than about the parameters. However, the parameters themselves are relatively stable, and the best performance (somewhat dubiously) comes from formulations where k=1. Let's look at this another way, by averaging across accuracies for levels of k:
+
+```{r}
+rbind(unique(ttParams[,2]), 
+      sapply(unique(ttParams[,2]), 
+             function(kval) mean(Accs[ttParams[,2]==kval])))
+```
+
+That's reassuring, insofar as k=1 yields almost the highest accuracy, and the SE on the k=11 accuracy is much higher because there were only two instances where that won. So, in the end, I'll be using k=1, dimensionality=4 to predict classes for the actual test set. First, I need to preprocess the complete training data set (and the test data set).
+
+```{r, results='hide'}
+preObjFinal <- preProcess(adjusted_data[,8:59], scale=c("center","scale"))
+trainingFinal <- data.matrix(predict(preObjFinal, adjusted_data[,8:59]))
+testingFinal <- data.matrix(predict(preObjFinal, adjusted_test[,8:59]))
+```
+
+Having done that, I need to carry out the cPCA procedure one last time (with dimensionality fixed at 4), and then finally use 1NN clustering to produce my predicted labels.
+
+```{r, results='hide'}
+cPCAoutFinal<-dataprocFuncCpca(trainingFinal, adjusted_data$classe, 4)
+
+predictionsFinal <- factor(rep("A", length(adjusted_test$problem_id)), levels = c("A","B","C","D","E"))
+
+for(item in 1:length(adjusted_test$problem_id)) {
+  
+  OptsFinal <- chooseSubspace(testingFinal[item,],trainingFinal,adjusted_data$classe,cPCAoutFinal)
+  
+  TestProjFinal<-testingFinal[item,] %*% cPCAoutFinal[[OptsFinal$OptSubInd]]
+  TrainProjFinal<-trainingFinal %*% cPCAoutFinal[[OptsFinal$OptSubInd]]
+  
+  dists<-distmat(TestProjFinal, TrainProjFinal)
+  
+  predictionsFinal[item] <- adjusted_data$classe[which.min(dists)]
+  
+}
+
+predictionsFinal
+```
+
+Finally, having generated predictions, I'll use the instructor-provided code to generate the necessary files (code not shown here).
+
+A bit of a post-mortem; overall accuracy was 0.65. This was 5-10% lower than expected, although the probability of getting 13/20 (or fewer) correct when the true accuracy is 0.7304348 is `r pbinom(13, 20, 0.7304348)`. There are two places where I think my approach could be improved (without changing my philosophy): first, it's possible that createDataPartition selected observations which were temporally clustered, and which also happened to be far from the temporal positions of the test items; and second, it's possible I could have used a more powerful classification approach than kNN (and ultimately, 1NN). However, given that chance performance was somewhere around 0.2 (without knowing the baserate of the most common class in the test set), 0.65 is decent, and with more time, I'm sure it would be higher still.
